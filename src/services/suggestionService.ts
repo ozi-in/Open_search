@@ -303,3 +303,209 @@ function applyDiscount(data) {
 // example
 const data = { price: "100", discount_type: "percent", discount: "12.5" };
 console.log(applyDiscount(data)); // { price: '100', discount_type: 'percent', discount: '12.5', sale_price: 87.5 }
+
+export async function getCatalogDataForOpenSearch() {
+  const lines: string[] = [];
+  const categoryDocs: { id: number; index: any; source: any }[] = [];
+  const productDocs: { id: number; index: any; source: any }[] = [];
+
+  const categories: any[] = await sequelize.query(
+    `SELECT id, name, parent_id, image, slug, icon_image, featured, position
+     FROM categories
+     ORDER BY parent_id, position`,
+    { type: QueryTypes.SELECT }
+  );
+
+  const mapByParent: Record<number, any[]> = {};
+  categories.forEach((cat) => {
+    if (!mapByParent[cat.parent_id]) mapByParent[cat.parent_id] = [];
+    mapByParent[cat.parent_id].push(cat);
+  });
+
+  function addCategory(cat: any) {
+    let type: string;
+    switch (cat.position) {
+      case 0:
+        type = "category";
+        break;
+      case 1:
+        type = "subcategory";
+        break;
+      case 2:
+        type = "subsubcategory";
+        break;
+      default:
+        type = "subcategory";
+    }
+
+    categoryDocs.push({
+      id: cat.id,
+      index: {
+        index: {
+          _index:
+            process.env.OPEN_SEARCH_CATEGORIES_INDEX || "dev-catalog-index",
+          _id: `cat_${cat.id}`,
+        },
+      },
+      source: {
+        type,
+        id: cat.id.toString(),
+        name: cat.name,
+        parent_id: cat.parent_id.toString(),
+        image: cat.image || "def.png",
+      },
+    });
+
+    if (mapByParent[cat.id]) {
+      mapByParent[cat.id].forEach(addCategory);
+    }
+  }
+
+  if (mapByParent[0]) {
+    mapByParent[0].forEach(addCategory);
+  }
+
+  const items: any[] = await sequelize.query(
+    `SELECT  i.id, i.name, i.image, i.price, i.discount, i.discount_type,
+            i.status, i.avg_rating, i.rating_count, i.slug, i.is_approved, 
+            i.try_and_buy, i.gender, i.age_group, i.category_id, i.variations,i.category_ids,
+            c1.name AS category_name,
+            c2.name AS subcategory_name,
+            c3.name AS subsubcategory_name
+     FROM items i
+     LEFT JOIN categories c1 ON c1.id = i.category_id AND c1.position = 0
+     LEFT JOIN categories c2 ON c2.id = i.category_id AND c2.position = 1
+     LEFT JOIN categories c3 ON c3.id = i.category_id AND c3.position = 2`,
+    { type: QueryTypes.SELECT }
+  );
+
+  const categoriesMap: Record<number, any> = {};
+  categories.forEach((c) => (categoriesMap[c.id] = c));
+
+  items.forEach((item) => {
+    const { category_name, subcategory_name, subsubcategory_name } =
+      resolveCategoryChain(item.category_id, categoriesMap);
+    const sale_price = applyDiscount({
+      price: item.price,
+      discount: item.discount,
+      discount_type: item.discount_type,
+    }).sale_price;
+    productDocs.push({
+      id: item.id,
+      index: {
+        index: {
+          _index:
+            process.env.OPEN_SEARCH_CATEGORIES_INDEX || "dev-catalog-index",
+          _id: `prod_${item.id}`,
+        },
+      },
+      source: {
+        type: "product",
+        id: item.id.toString(),
+        name: item.name,
+        image: item.image || "def.png",
+        price: item.price.toString(),
+        discount: item.discount.toString(),
+        discount_type: item.discount_type,
+        status: item.status.toString(),
+        avg_rating: item.avg_rating?.toString() || "0.00000000000000",
+        rating_count: item.rating_count?.toString() || "0",
+        slug: item.slug,
+        is_approved: item.is_approved?.toString() || "1",
+        try_and_buy: item.try_and_buy?.toString() || "0",
+        gender: item.gender || "unisex",
+        age_group: item.age_group,
+        category_id: item.category_id?.toString(),
+        category_name,
+        subcategory_name,
+        subsubcategory_name,
+        variations: item.variations || [],
+        sale_price: sale_price.toString(),
+      },
+    });
+  });
+
+  categoryDocs.sort((a, b) => a.id - b.id);
+  productDocs.sort((a, b) => a.id - b.id);
+
+  [...categoryDocs, ...productDocs].forEach((d) => {
+    if (typeof d.source.age_group === "string") {
+      try {
+        d.source.age_group = JSON.parse(d.source.age_group);
+      } catch {
+        d.source.age_group = [d.source.age_group];
+      }
+    }
+    lines.push(JSON.stringify(d.index));
+    lines.push(JSON.stringify(d.source));
+  });
+
+  console.log(
+    `OpenSearch bulk JSON prepared: ${categories.length} categories, ${items.length} products.`
+  );
+
+  return {
+    bulkData: lines.join("\n") + "\n",
+    categoryCount: categories.length,
+    productCount: items.length,
+    totalCount: lines.length / 2
+  };
+}
+
+export async function deleteOpenSearchIndex() {
+  try {
+    const indexName = process.env.OPEN_SEARCH_CATEGORIES_INDEX || "dev-catalog-index";
+    console.log(`Deleting OpenSearch index: ${indexName}`);
+
+    const response = await client.indices.delete({
+      index: indexName
+    });
+
+    console.log("Index deleted successfully:", response.body);
+    return {
+      success: true,
+      response: response.body,
+      indexName
+    };
+  } catch (error: any) {
+    // If index doesn't exist, that's okay - we can continue
+    if (error.statusCode === 404) {
+      console.log("Index doesn't exist, continuing with data push...");
+      return {
+        success: true,
+        response: { acknowledged: true, message: "Index did not exist" },
+        indexName: process.env.OPEN_SEARCH_CATEGORIES_INDEX || "dev-catalog-index"
+      };
+    }
+    console.error("Error deleting OpenSearch index:", error);
+    throw error;
+  }
+}
+
+export async function pushCatalogDataToOpenSearch() {
+  try {
+    // First delete the existing index
+    const deleteResult = await deleteOpenSearchIndex();
+    console.log("Delete operation result:", deleteResult);
+
+    // Get the formatted data
+    const { bulkData, categoryCount, productCount, totalCount } = await getCatalogDataForOpenSearch();
+
+    console.log("Pushing catalog data directly to OpenSearch...");
+
+    // Push directly to OpenSearch
+    const response = await client.bulk({ body: bulkData as any });
+
+    return {
+      success: true,
+      deleteResult,
+      response: response.body,
+      categoryCount,
+      productCount,
+      totalCount
+    };
+  } catch (error) {
+    console.error("Error pushing catalog data to OpenSearch:", error);
+    throw error;
+  }
+}
